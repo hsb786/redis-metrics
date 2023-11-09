@@ -2,14 +2,11 @@ package com.example.redis;
 
 import com.example.redis.pattern.JdkRegexpRedisKeyPatternParse;
 import com.example.redis.pattern.RedisKeyPatternParse;
-import org.springframework.boot.autoconfigure.AutoConfigureAfter;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
-import org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration;
 import org.springframework.context.annotation.Bean;
 
 import java.util.Collections;
 
-@AutoConfigureAfter(RedisAutoConfiguration.class)
 public class CustomRedisMetricsAutoConfiguration {
 
     @Bean

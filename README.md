@@ -14,55 +14,34 @@ lettuce自带metrics，但只统计到command的纬度，没有具体的key tag
 
 ## 实现
 ### keyPattern聚合
-假设keyPattern = user:%s，具体的key可能为user:1、user:2 ....，直接将具体的key统计成tag，会导致tag数量异常的多，最终导致prometheus内存不够，所以要按照keyPattern进行聚合
+例如keyPattern = user:%s，具体的key为user:1、user:2 ....，如果直接将具体的key统计成tag，会导致tag数量异常的多，将会引发outOfMemory，所以要按照keyPattern进行聚合
 
 ![RedisKeyPatternParse](./doc/image/RedisKeyPatternParse.png)
 * RedisKeyPatternParse: 用于将原始key解析成keyPattern
-* RedisKeyEnumPatternParse: 根据keyPattern枚举 将原始key解析成keyPattern
+* JdkRegexpRedisKeyPatternParse: Jdk正则转换
 
 示例：
 
-定义key pattern枚举
+定义key pattern常量类
 ```
-public enum RedisKeyEnum implements BaseRedisKey {
-  USER_KEY("user:%s:%s", "user info"),
-  ;
-
-  private String pattern;
-
-  private String desc;
-
-  RedisKeyEnum(String pattern, String desc) {
-    this.pattern = pattern;
-    this.desc = desc;
-  }
-
-  @Override
-  public String pattern() {
-    return this.pattern;
-  }
-
-  @Override
-  public String desc() {
-    return this.desc;
-  }
+public class RedisKeyConstantTest {
+    public static String USER_KEY = "user:%s";
 }
 ```
 
 初始化RedisKeyPatternParse，解析原始key对应的keyPattern
 ```
+    protected RedisKeyPatternParse redisPatternParse = new JdkRegexpRedisKeyPatternParse(RedisKeyConstantTest.class);
+    
     @Test
-    void parse() {
-        RedisKeyPatternParse redisPatternParse = RedisKeyEnumPatternParse.createRedisPatternParse(RedisKeyEnum.class);
-        Optional<ParseResult> keyPattern = redisPatternParse.parse("user:11");
-        assertEquals("user:.*", keyPattern.map(ParseResult::getPattern).orElse(null));
+    void exist_parse() {
+        Optional<String> keyPattern = redisPatternParse.parse("user:11");
+        assertEquals("user:.*", keyPattern.orElse(null));
     }
 ```
 
 ### 集成到现有框架中
-现有项目都是通过redisTemplate操作redis, 所以目标就是给redisTemplate增加metrics的功能
-
-代码现状，基本都是获取一个valueOperation，再通过valueOperation进行操作
+现有项目都是通过redisTemplate操作redis
 ```
 redisTemplate.opsForValue().set("user:1","aaaaaa")
 ```
@@ -86,29 +65,33 @@ public class RedisTemplate<K, V> extends RedisAccessor implements RedisOperation
 所以换个思路：
 1. 创建redisTemplate代理对象，拦截opsForValue方法，返回代理的ValueOperations
 2. valueOperations也是代理对象，方法执行前后会调用redisMetrics进行统计
-3. redisMetrics会调用RedisKeyPatternParse提取keyPattern进行统计
+3. redisMetrics会调用RedisKeyPatternParse解析keyPattern
 
 
 
 ## 实现
-通过实现BeanPostProcessor，用代理redisTemplate替换原生redisTemplate。 代理的redisTemplate执行opsForValue方法返回代理的valueOperations
+定义RedisTemplateAspect，拦截opsFor方法，创建对应对代理对象
 ```
-public class RedisTemplateMetricsBeanPostProcessor implements BeanPostProcessor {
+@Aspect
+public class RedisTemplateAspect {
     ...
 
-    @Override
-    public Object postProcessAfterInitialization(Object bean, String beanName) throws BeansException {
-        if (bean instanceof RedisTemplate) {
-            RedisMethodInterceptor redisMethodInterceptor = createRedisMethodInterceptor();
-            ProxyFactory proxyFactory = new ProxyFactory(bean);
-            proxyFactory.addAdvice(redisMethodInterceptor);
-            proxyFactory.addAdvice(
-                    RedisOperationMethodInterceptor.createRedisOperationMethodInterceptor(
-                            redisMethodInterceptor));
-            proxyFactory.setProxyTargetClass(true);
-            return proxyFactory.getProxy();
+    @Pointcut("execution(public * org.springframework.data.redis.core.RedisTemplate.opsFor*())")
+    public void operationPointCut() {
+
+    }
+
+    @Around("operationPointCut()")
+    public Object aroundOpsFor(ProceedingJoinPoint joinPoint) throws Throwable {
+        Object result = joinPoint.proceed();
+        if (needProxy(result)) {
+            return operationProxyCache.computeIfAbsent(result, (re) -> {
+                ProxyFactory proxyFactory = new ProxyFactory(result);
+                proxyFactory.addAdvice(redisOperationMethodInterceptor);
+                return proxyFactory.getProxy();
+            });
         }
-        return BeanPostProcessor.super.postProcessAfterInitialization(bean, beanName);
+        return result;
     }
     ...
 
@@ -118,38 +101,37 @@ public class RedisTemplateMetricsBeanPostProcessor implements BeanPostProcessor 
 ```
 public class RedisOperationMethodInterceptor implements MethodInterceptor {
 
-    private final Map<Object, Object> operationProxyCache = new ConcurrentHashMap<>();
+    private static final Logger LOG = LoggerFactory.getLogger(RedisOperationMethodInterceptor.class);
 
-    public static RedisOperationMethodInterceptor createRedisOperationMethodInterceptor(
-            RedisMethodInterceptor redisMethodInterceptor) {
-        return new RedisOperationMethodInterceptor(redisMethodInterceptor);
+    private final RedisMetrics redisMetrics;
+
+    public RedisOperationMethodInterceptor(RedisMetrics redisMetrics) {
+        this.redisMetrics = redisMetrics;
     }
 
-    @Nullable
     @Override
-    public Object invoke(@Nonnull MethodInvocation invocation) throws Throwable {
-        Object result = invocation.proceed();
-
-        try {
-            if (needProxy(invocation, result)) {
-                return operationProxyCache.computeIfAbsent(result, key -> wrapper(result));
-            }
-        } catch (Exception e) {
-            LOG.warn("create redis proxy operation error", e);
-            return result;
+    public Object invoke(MethodInvocation invocation) throws Throwable {
+        Object[] arguments = invocation.getArguments();
+        boolean needMetrics = arguments.length > 0 && arguments[0] instanceof String;
+        if (!needMetrics) {
+            return invocation.proceed();
         }
 
+        long start = System.currentTimeMillis();
+        Object result;
+        String key = (String) arguments[0];
+        String command = invocation.getMethod().getName();
+        try {
+            result = invocation.proceed();
+        } catch (Exception e) {
+            LOG.warn("redis execute error", e);
+            redisMetrics.metrics(key, command, System.currentTimeMillis() - start, e);
+            throw e;
+        }
+        redisMetrics.metrics(key, command, System.currentTimeMillis() - start, null);
         return result;
     }
-
-    private Object wrapper(Object result) {
-        ProxyFactory proxyFactory = new ProxyFactory(result);
-        proxyFactory.addAdvice(redisMethodInterceptor);
-        Object proxy = proxyFactory.getProxy();
-        LOG.info(String.format("create proxy success, obj:%s", proxy));
-        return proxy;
-    }
-    ...
+}
 
 ```
 
@@ -157,18 +139,12 @@ RedisMetrics通过redisPatternParse提取keyPattern，进行统计
 ```
 public class RedisMetrics {
    ...
-    public static RedisMetrics createRedisMetrics(
-            RedisKeyPatternParse redisPatternParse, MeterRegistry meterRegistry) {
-        return new RedisMetrics(redisPatternParse, meterRegistry);
-    }
-
-    public void metrics(String originalKey, String command, long start, Exception e) {
-        Optional<ParseResult> parseResultOptional = redisPatternParse.parse(originalKey);
+     public void metrics(String originalKey, String command, long cost, Exception e) {
+        Optional<String> parseResultOptional = redisPatternParse.parse(originalKey);
         if (parseResultOptional.isPresent()) {
-            ParseResult parseResult = parseResultOptional.get();
-            doMetrics(parseResult.getPattern(), parseResult.getDesc(), command, start, e);
+            doMetrics(parseResultOptional.get(), command, cost, e);
         } else {
-            doMetrics("UNKNOWN", "UNKNOWN", command, start, e);
+            doMetrics("UNKNOWN", command, cost, e);
             LOG.debug(
                     "not found key, originalKey:{}, redisPatternParse:{}",
                     originalKey,
@@ -179,9 +155,8 @@ public class RedisMetrics {
 
 
 ## 结果
-只需定义枚举实现BaseRedisKey，就可以完成keyPattern的统计，无需修改业务代码
 ```
-redis_seconds_count{command="set",desc="user info",exception="None",key="user:.*",} 1.0
+redis_seconds_count{command="set",exception="None",key="user:.*",} 1.0
 ```
 
 

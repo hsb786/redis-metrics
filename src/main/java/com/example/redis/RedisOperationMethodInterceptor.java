@@ -1,76 +1,40 @@
 package com.example.redis;
 
-import java.util.Map;
-import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
-import javax.annotation.Nonnull;
-import javax.annotation.Nullable;
-
 import org.aopalliance.intercept.MethodInterceptor;
 import org.aopalliance.intercept.MethodInvocation;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
-import org.springframework.aop.framework.ProxyFactory;
-import org.springframework.data.redis.core.HashOperations;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-/**
- * @author hushengbin
- * @date 2023-03-07 0:40
- */
 public class RedisOperationMethodInterceptor implements MethodInterceptor {
 
-    private static final Log LOG = LogFactory.getLog(RedisOperationMethodInterceptor.class);
+    private static final Logger LOG = LoggerFactory.getLogger(RedisOperationMethodInterceptor.class);
 
-    private final RedisMethodInterceptor redisMethodInterceptor;
+    private final RedisMetrics redisMetrics;
 
-    private final Map<Object, Object> operationProxyCache = new ConcurrentHashMap<>();
-
-    private RedisOperationMethodInterceptor(RedisMethodInterceptor redisMethodInterceptor) {
-        this.redisMethodInterceptor = redisMethodInterceptor;
+    public RedisOperationMethodInterceptor(RedisMetrics redisMetrics) {
+        this.redisMetrics = redisMetrics;
     }
 
-    public static RedisOperationMethodInterceptor createRedisOperationMethodInterceptor(
-            RedisMethodInterceptor redisMethodInterceptor) {
-        return new RedisOperationMethodInterceptor(redisMethodInterceptor);
-    }
-
-    @Nullable
     @Override
-    public Object invoke(@Nonnull MethodInvocation invocation) throws Throwable {
-        Object result = invocation.proceed();
-
-        try {
-            if (needProxy(invocation, result)) {
-                return operationProxyCache.computeIfAbsent(result, key -> wrapper(result));
-            }
-        } catch (Exception e) {
-            LOG.warn("create redis proxy operation error", e);
-            return result;
+    public Object invoke(MethodInvocation invocation) throws Throwable {
+        Object[] arguments = invocation.getArguments();
+        boolean needMetrics = arguments.length > 0 && arguments[0] instanceof String;
+        if (!needMetrics) {
+            return invocation.proceed();
         }
 
+        long start = System.currentTimeMillis();
+        Object result;
+        String key = (String) arguments[0];
+        String command = invocation.getMethod().getName();
+        try {
+            result = invocation.proceed();
+        } catch (Exception e) {
+            LOG.warn("redis execute error", e);
+            redisMetrics.metrics(key, command, System.currentTimeMillis() - start, e);
+            throw e;
+        }
+        redisMetrics.metrics(key, command, System.currentTimeMillis() - start, null);
         return result;
-    }
-
-    private Object wrapper(Object result) {
-        ProxyFactory proxyFactory = new ProxyFactory(result);
-        proxyFactory.addAdvice(redisMethodInterceptor);
-        Object proxy = proxyFactory.getProxy();
-        LOG.info(String.format("create proxy success, obj:%s", proxy));
-        return proxy;
-    }
-
-    private boolean needProxy(MethodInvocation invocation, Object result) {
-        return isEmptyArguments(invocation)
-                && Optional.ofNullable(result)
-                .filter(obj -> !(obj instanceof HashOperations))
-                .map(Object::getClass)
-                .map(Class::getSuperclass)
-                .map(Class::getName)
-                .filter("org.springframework.data.redis.core.AbstractOperations"::equals)
-                .isPresent();
-    }
-
-    private static boolean isEmptyArguments(MethodInvocation invocation) {
-        return invocation.getArguments().length == 0;
     }
 }

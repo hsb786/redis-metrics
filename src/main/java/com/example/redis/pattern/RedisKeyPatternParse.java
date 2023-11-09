@@ -8,5 +8,5 @@ import java.util.Optional;
  */
 public interface RedisKeyPatternParse {
 
-    Optional<ParseResult> parse(String original);
+    Optional<String> parse(String original);
 }
